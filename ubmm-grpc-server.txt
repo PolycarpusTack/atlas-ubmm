@@ -1,0 +1,471 @@
+// services/backlog-service/internal/adapters/grpc/server.go
+
+package grpc
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/google/uuid"
+	"go.uber.org/zap"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/types/known/emptypb"
+	"google.golang.org/protobuf/types/known/timestamppb"
+
+	"github.com/ubmm/backlog-service/internal/domain/model"
+	"github.com/ubmm/backlog-service/internal/domain/repository"
+	"github.com/ubmm/backlog-service/internal/domain/service"
+	pb "github.com/ubmm/backlog-service/pkg/api/v1"
+)
+
+// BacklogServer implements the gRPC server for backlog service
+type BacklogServer struct {
+	pb.UnimplementedBacklogServiceServer
+	service *service.BacklogService
+	logger  *zap.Logger
+}
+
+// NewBacklogServer creates a new backlog gRPC server
+func NewBacklogServer(service *service.BacklogService, logger *zap.Logger) *BacklogServer {
+	return &BacklogServer{
+		service: service,
+		logger:  logger,
+	}
+}
+
+// CreateItem creates a new backlog item
+func (s *BacklogServer) CreateItem(ctx context.Context, req *pb.CreateItemRequest) (*pb.BacklogItem, error) {
+	// Validate request
+	if err := validateCreateItemRequest(req); err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid request: %v", err)
+	}
+
+	// Convert request to domain model
+	var parentID *uuid.UUID
+	if req.ParentId != "" {
+		id, err := uuid.Parse(req.ParentId)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid parent ID: %v", err)
+		}
+		parentID = &id
+	}
+
+	itemType, err := convertToItemType(req.Type)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid item type: %v", err)
+	}
+
+	// Create domain request
+	createReq := &service.CreateItemRequest{
+		Type:        itemType,
+		Title:       req.Title,
+		Description: req.Description,
+		ParentID:    parentID,
+		StoryPoints: int(req.StoryPoints),
+		Tags:        req.Tags,
+		Assignee:    req.Assignee,
+	}
+
+	// Call domain service
+	item, err := s.service.CreateItem(ctx, createReq)
+	if err != nil {
+		s.logger.Error("Failed to create item", zap.Error(err))
+		return nil, status.Errorf(codes.Internal, "failed to create item: %v", err)
+	}
+
+	// Convert domain model to response
+	return convertToProtoItem(item), nil
+}
+
+// GetItem retrieves a backlog item by ID
+func (s *BacklogServer) GetItem(ctx context.Context, req *pb.GetItemRequest) (*pb.BacklogItem, error) {
+	// Validate request
+	if req.Id == "" {
+		return nil, status.Error(codes.InvalidArgument, "item ID is required")
+	}
+
+	// Parse item ID
+	id, err := uuid.Parse(req.Id)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid item ID: %v", err)
+	}
+
+	// Call domain service
+	item, err := s.service.GetItem(ctx, id)
+	if err != nil {
+		s.logger.Error("Failed to get item", zap.String("id", id.String()), zap.Error(err))
+		return nil, status.Errorf(codes.NotFound, "item not found: %v", err)
+	}
+
+	// Convert domain model to response
+	return convertToProtoItem(item), nil
+}
+
+// UpdateItem updates an existing backlog item
+func (s *BacklogServer) UpdateItem(ctx context.Context, req *pb.UpdateItemRequest) (*pb.BacklogItem, error) {
+	// Validate request
+	if req.Id == "" {
+		return nil, status.Error(codes.InvalidArgument, "item ID is required")
+	}
+
+	// Parse item ID
+	id, err := uuid.Parse(req.Id)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid item ID: %v", err)
+	}
+
+	// Build update request
+	updateReq := &service.UpdateItemRequest{}
+
+	if req.Title != nil {
+		updateReq.Title = &req.Title.Value
+	}
+	if req.Description != nil {
+		updateReq.Description = &req.Description.Value
+	}
+	if req.Status != nil {
+		status, err := convertToItemStatus(req.Status.Value)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid item status: %v", err)
+		}
+		updateReq.Status = &status
+	}
+	if req.StoryPoints != nil {
+		storyPoints := int(req.StoryPoints.Value)
+		updateReq.StoryPoints = &storyPoints
+	}
+	if req.Priority != nil {
+		priority := int(req.Priority.Value)
+		updateReq.Priority = &priority
+	}
+	if req.ParentId != nil {
+		if req.ParentId.Value == "" {
+			// Null parent ID
+			nilID := uuid.Nil
+			updateReq.ParentID = &nilID
+		} else {
+			parentID, err := uuid.Parse(req.ParentId.Value)
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid parent ID: %v", err)
+			}
+			updateReq.ParentID = &parentID
+		}
+	}
+	if req.Assignee != nil {
+		updateReq.Assignee = &req.Assignee.Value
+	}
+	if req.Tags != nil {
+		updateReq.Tags = &req.Tags.Value
+	}
+
+	// Call domain service
+	item, err := s.service.UpdateItem(ctx, id, updateReq)
+	if err != nil {
+		s.logger.Error("Failed to update item", zap.String("id", id.String()), zap.Error(err))
+		return nil, status.Errorf(codes.Internal, "failed to update item: %v", err)
+	}
+
+	// Convert domain model to response
+	return convertToProtoItem(item), nil
+}
+
+// DeleteItem deletes a backlog item
+func (s *BacklogServer) DeleteItem(ctx context.Context, req *pb.DeleteItemRequest) (*emptypb.Empty, error) {
+	// Validate request
+	if req.Id == "" {
+		return nil, status.Error(codes.InvalidArgument, "item ID is required")
+	}
+
+	// Parse item ID
+	id, err := uuid.Parse(req.Id)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid item ID: %v", err)
+	}
+
+	// Call domain service
+	err = s.service.DeleteItem(ctx, id)
+	if err != nil {
+		s.logger.Error("Failed to delete item", zap.String("id", id.String()), zap.Error(err))
+		return nil, status.Errorf(codes.Internal, "failed to delete item: %v", err)
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
+// ListItems lists backlog items with filtering
+func (s *BacklogServer) ListItems(ctx context.Context, req *pb.ListItemsRequest) (*pb.ListItemsResponse, error) {
+	// Build filter
+	filter := repository.BacklogFilter{
+		Limit:  int(req.PageSize),
+		Offset: int(req.PageSize * req.PageToken),
+	}
+
+	// Apply filters
+	if len(req.Types) > 0 {
+		for _, t := range req.Types {
+			itemType, err := convertToItemType(t)
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid item type: %v", err)
+			}
+			filter.Types = append(filter.Types, itemType)
+		}
+	}
+
+	if len(req.Statuses) > 0 {
+		for _, st := range req.Statuses {
+			itemStatus, err := convertToItemStatus(st)
+			if err != nil {
+				return nil, status.Errorf(codes.InvalidArgument, "invalid item status: %v", err)
+			}
+			filter.Statuses = append(filter.Statuses, itemStatus)
+		}
+	}
+
+	if len(req.Tags) > 0 {
+		filter.Tags = req.Tags
+	}
+
+	if req.ParentId != "" {
+		parentID, err := uuid.Parse(req.ParentId)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid parent ID: %v", err)
+		}
+		filter.ParentID = &parentID
+	}
+
+	if req.Assignee != "" {
+		filter.Assignee = req.Assignee
+	}
+
+	if req.SearchQuery != "" {
+		filter.SearchQuery = req.SearchQuery
+	}
+
+	if req.SortBy != "" {
+		filter.SortBy = req.SortBy
+		filter.SortOrder = req.SortOrder
+	}
+
+	// Call domain service
+	items, totalCount, err := s.service.ListItems(ctx, filter)
+	if err != nil {
+		s.logger.Error("Failed to list items", zap.Error(err))
+		return nil, status.Errorf(codes.Internal, "failed to list items: %v", err)
+	}
+
+	// Build response
+	response := &pb.ListItemsResponse{
+		Items:      make([]*pb.BacklogItem, 0, len(items)),
+		TotalCount: int32(totalCount),
+		NextPageToken: int64(0),
+	}
+
+	// Convert domain models to proto
+	for _, item := range items {
+		response.Items = append(response.Items, convertToProtoItem(item))
+	}
+
+	// Set next page token if there are more items
+	if int64(len(items)) == req.PageSize && totalCount > int64(len(items)+int(req.PageSize*req.PageToken)) {
+		response.NextPageToken = req.PageToken + 1
+	}
+
+	return response, nil
+}
+
+// GetChildren retrieves all children of a backlog item
+func (s *BacklogServer) GetChildren(ctx context.Context, req *pb.GetChildrenRequest) (*pb.GetChildrenResponse, error) {
+	// Validate request
+	if req.ParentId == "" {
+		return nil, status.Error(codes.InvalidArgument, "parent ID is required")
+	}
+
+	// Parse parent ID
+	parentID, err := uuid.Parse(req.ParentId)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid parent ID: %v", err)
+	}
+
+	// Call domain service
+	children, err := s.service.GetChildren(ctx, parentID)
+	if err != nil {
+		s.logger.Error("Failed to get children", zap.String("parentID", parentID.String()), zap.Error(err))
+		return nil, status.Errorf(codes.Internal, "failed to get children: %v", err)
+	}
+
+	// Build response
+	response := &pb.GetChildrenResponse{
+		Items: make([]*pb.BacklogItem, 0, len(children)),
+	}
+
+	// Convert domain models to proto
+	for _, item := range children {
+		response.Items = append(response.Items, convertToProtoItem(item))
+	}
+
+	return response, nil
+}
+
+// ReorderItems reorders backlog items by updating their priorities
+func (s *BacklogServer) ReorderItems(ctx context.Context, req *pb.ReorderItemsRequest) (*emptypb.Empty, error) {
+	// Validate request
+	if len(req.Items) == 0 {
+		return nil, status.Error(codes.InvalidArgument, "at least one item is required")
+	}
+
+	// Build reorder requests
+	reorderRequests := make([]service.ReorderRequest, 0, len(req.Items))
+	for _, item := range req.Items {
+		if item.Id == "" {
+			return nil, status.Error(codes.InvalidArgument, "item ID is required")
+		}
+
+		// Parse item ID
+		id, err := uuid.Parse(item.Id)
+		if err != nil {
+			return nil, status.Errorf(codes.InvalidArgument, "invalid item ID: %v", err)
+		}
+
+		reorderRequests = append(reorderRequests, service.ReorderRequest{
+			ItemID:      id,
+			NewPriority: int(item.Priority),
+		})
+	}
+
+	// Call domain service
+	err := s.service.ReorderItems(ctx, reorderRequests)
+	if err != nil {
+		s.logger.Error("Failed to reorder items", zap.Error(err))
+		return nil, status.Errorf(codes.Internal, "failed to reorder items: %v", err)
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
+// SetExternalID sets an external system ID for a backlog item
+func (s *BacklogServer) SetExternalID(ctx context.Context, req *pb.SetExternalIDRequest) (*emptypb.Empty, error) {
+	// Validate request
+	if req.Id == "" {
+		return nil, status.Error(codes.InvalidArgument, "item ID is required")
+	}
+	if req.System == "" {
+		return nil, status.Error(codes.InvalidArgument, "system is required")
+	}
+	if req.ExternalId == "" {
+		return nil, status.Error(codes.InvalidArgument, "external ID is required")
+	}
+
+	// Parse item ID
+	id, err := uuid.Parse(req.Id)
+	if err != nil {
+		return nil, status.Errorf(codes.InvalidArgument, "invalid item ID: %v", err)
+	}
+
+	// Call domain service
+	err = s.service.SetExternalID(ctx, id, req.System, req.ExternalId)
+	if err != nil {
+		s.logger.Error("Failed to set external ID", 
+			zap.String("id", id.String()), 
+			zap.String("system", req.System),
+			zap.String("externalId", req.ExternalId),
+			zap.Error(err))
+		return nil, status.Errorf(codes.Internal, "failed to set external ID: %v", err)
+	}
+
+	return &emptypb.Empty{}, nil
+}
+
+// GetMetrics retrieves backlog metrics
+func (s *BacklogServer) GetMetrics(ctx context.Context, req *emptypb.Empty) (*pb.BacklogMetrics, error) {
+	// Call domain service
+	metrics, err := s.service.GetMetrics(ctx)
+	if err != nil {
+		s.logger.Error("Failed to get metrics", zap.Error(err))
+		return nil, status.Errorf(codes.Internal, "failed to get metrics: %v", err)
+	}
+
+	// Convert domain model to proto
+	return &pb.BacklogMetrics{
+		TotalItems:           int32(metrics.TotalItems),
+		EpicCount:            int32(metrics.EpicCount),
+		FeatureCount:         int32(metrics.FeatureCount),
+		StoryCount:           int32(metrics.StoryCount),
+		AverageAge:           float32(metrics.AverageAge),
+		WipCount:             int32(metrics.WIPCount),
+		LeadTimeDays:         float32(metrics.LeadTimeDays),
+		ThroughputLast30Days: int32(metrics.ThroughputLast30Days),
+		IcebergRatio:         float32(metrics.IcebergRatio),
+		HealthStatus:         metrics.HealthStatus,
+	}, nil
+}
+
+// Helper functions for request validation and conversion
+
+func validateCreateItemRequest(req *pb.CreateItemRequest) error {
+	if req.Title == "" {
+		return fmt.Errorf("title is required")
+	}
+	if req.Type == "" {
+		return fmt.Errorf("type is required")
+	}
+	return nil
+}
+
+func convertToItemType(typeStr string) (model.ItemType, error) {
+	switch typeStr {
+	case "EPIC":
+		return model.ItemTypeEpic, nil
+	case "FEATURE":
+		return model.ItemTypeFeature, nil
+	case "STORY":
+		return model.ItemTypeStory, nil
+	default:
+		return "", fmt.Errorf("unknown item type: %s", typeStr)
+	}
+}
+
+func convertToItemStatus(statusStr string) (model.ItemStatus, error) {
+	switch statusStr {
+	case "NEW":
+		return model.ItemStatusNew, nil
+	case "READY":
+		return model.ItemStatusReady, nil
+	case "IN_PROGRESS":
+		return model.ItemStatusInProgress, nil
+	case "DONE":
+		return model.ItemStatusDone, nil
+	case "BLOCKED":
+		return model.ItemStatusBlocked, nil
+	default:
+		return "", fmt.Errorf("unknown item status: %s", statusStr)
+	}
+}
+
+func convertToProtoItem(item *model.BacklogItem) *pb.BacklogItem {
+	protoItem := &pb.BacklogItem{
+		Id:          item.ID.String(),
+		Type:        string(item.Type),
+		Title:       item.Title,
+		Description: item.Description,
+		StoryPoints: int32(item.StoryPoints),
+		Status:      string(item.Status),
+		Priority:    int32(item.Priority),
+		Assignee:    item.Assignee,
+		Tags:        item.Tags,
+		CreatedAt:   timestamppb.New(item.CreatedAt),
+		UpdatedAt:   timestamppb.New(item.UpdatedAt),
+		ExternalIds: make(map[string]string),
+	}
+
+	if item.ParentID != nil {
+		protoItem.ParentId = item.ParentID.String()
+	}
+
+	for key, value := range item.ExternalIDs {
+		protoItem.ExternalIds[key] = value
+	}
+
+	return protoItem
+}

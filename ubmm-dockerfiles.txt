@@ -1,0 +1,350 @@
+# services/backlog-service/Dockerfile
+
+# Build stage
+FROM golang:1.22-alpine AS builder
+
+WORKDIR /app
+
+# Install necessary build tools
+RUN apk add --no-cache git
+
+# Copy go module files first for better layer caching
+COPY go.mod go.sum ./
+RUN go mod download
+
+# Copy source code
+COPY . .
+
+# Build the application with optimizations
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -a -installsuffix cgo -ldflags="-w -s" -o backlog-service cmd/main.go
+
+# Final stage
+FROM alpine:3.19
+
+# Add non-root user for security
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+# Add CA certificates for HTTPS
+RUN apk --no-cache add ca-certificates tzdata
+
+# Set timezone to UTC
+ENV TZ=UTC
+
+WORKDIR /app
+
+# Copy binary from builder stage
+COPY --from=builder /app/backlog-service .
+
+# Copy migrations
+COPY --from=builder /app/migrations ./migrations
+
+# Copy config files
+COPY --from=builder /app/config ./config
+
+# Set ownership to non-root user
+RUN chown -R appuser:appgroup /app
+
+# Use non-root user
+USER appuser
+
+# Expose HTTP and gRPC ports
+EXPOSE 8080 8081
+
+# Run the service
+CMD ["./backlog-service"]
+
+# api-gateway/Dockerfile
+
+# Build stage
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+RUN npm ci
+
+# Copy source code
+COPY . .
+
+# Build the application
+RUN npm run build
+
+# Final stage
+FROM node:20-alpine
+
+# Add non-root user for security
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+# Set timezone to UTC
+ENV TZ=UTC
+
+WORKDIR /app
+
+# Copy built assets from builder stage
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package*.json ./
+COPY --from=builder /app/src/schema ./dist/schema
+
+# Set ownership to non-root user
+RUN chown -R appuser:appgroup /app
+
+# Use non-root user
+USER appuser
+
+# Expose GraphQL port
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD wget -qO- http://localhost:3000/health || exit 1
+
+# Run the service
+CMD ["node", "dist/index.js"]
+
+# frontend/Dockerfile
+
+# Build stage
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+# Copy package files
+COPY package*.json ./
+RUN npm ci
+
+# Copy source code
+COPY . .
+
+# Build the application for production
+RUN npm run build
+
+# Final stage
+FROM node:20-alpine
+
+# Add non-root user for security
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
+
+# Set timezone to UTC
+ENV TZ=UTC
+
+WORKDIR /app
+
+# Copy built assets from builder stage
+COPY --from=builder /app/.next ./.next
+COPY --from=builder /app/node_modules ./node_modules
+COPY --from=builder /app/package*.json ./
+COPY --from=builder /app/public ./public
+COPY --from=builder /app/next.config.js ./
+
+# Set ownership to non-root user
+RUN chown -R appuser:appgroup /app
+
+# Use non-root user
+USER appuser
+
+# Expose Next.js port
+EXPOSE 3000
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 CMD wget -qO- http://localhost:3000/health || exit 1
+
+# Run the production server
+CMD ["npm", "start"]
+
+# docker-compose.yml
+
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:15.4
+    container_name: ubmm-postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ubmm
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:6
+    container_name: ubmm-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  kafka:
+    image: confluentinc/cp-kafka:7.4.0
+    container_name: ubmm-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "kafka:29092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.4.0
+    container_name: ubmm-zookeeper
+    ports:
+      - "2181:2181"
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "2181"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  backlog-service:
+    build:
+      context: ./services/backlog-service
+      dockerfile: Dockerfile
+    container_name: ubmm-backlog-service
+    ports:
+      - "8080:8080"
+      - "8081:8081"
+    environment:
+      - ENVIRONMENT=development
+      - DATABASE_HOST=postgres
+      - DATABASE_PORT=5432
+      - DATABASE_USERNAME=postgres
+      - DATABASE_PASSWORD=postgres
+      - DATABASE_NAME=ubmm
+      - REDIS_HOST=redis
+      - REDIS_PORT=6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:29092
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      kafka:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:8081/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api-gateway:
+    build:
+      context: ./api-gateway
+      dockerfile: Dockerfile
+    container_name: ubmm-api-gateway
+    ports:
+      - "3000:3000"
+    environment:
+      - ENVIRONMENT=development
+      - BACKLOG_SERVICE_URL=backlog-service:8080
+    depends_on:
+      backlog-service:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: ubmm-frontend
+    ports:
+      - "3001:3000"
+    environment:
+      - ENVIRONMENT=development
+      - NEXT_PUBLIC_API_URL=http://localhost:3000
+    depends_on:
+      api-gateway:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres-data:
+  redis-data:
+
+# .dockerignore
+
+# Common patterns
+node_modules
+npm-debug.log
+yarn-debug.log
+yarn-error.log
+.git
+.gitignore
+.github
+*.md
+!README.md
+!CHANGELOG.md
+
+# Go-specific
+*.exe
+*.test
+*.prof
+.idea/
+.vscode/
+coverage.txt
+vendor/
+tmp/
+
+# Node-specific
+.npm
+.yarn
+*.log
+dist
+.env
+.env.local
+.env.*.local
+.DS_Store
+
+# Next.js specific
+.next/
+out/
+
+# Testing files
+coverage/
+jest.config.js
+*.test.*
+*.spec.*
+
+# Documentation
+docs/
+
+# Terraform
+**/.terraform/*
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.tfvars

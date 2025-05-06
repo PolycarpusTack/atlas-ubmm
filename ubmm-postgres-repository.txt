@@ -1,0 +1,724 @@
+// services/backlog-service/internal/adapters/db/postgres.go
+
+package db
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/jmoiron/sqlx"
+	"github.com/lib/pq"
+	_ "github.com/lib/pq" // postgres driver
+	"go.uber.org/zap"
+
+	"github.com/ubmm/backlog-service/internal/config"
+	"github.com/ubmm/backlog-service/internal/domain/model"
+	"github.com/ubmm/backlog-service/internal/domain/repository"
+)
+
+// PostgresAdapter implements the repository interfaces
+type PostgresAdapter struct {
+	db     *sqlx.DB
+	logger *zap.Logger
+}
+
+// NewPostgresAdapter creates a new PostgresAdapter
+func NewPostgresAdapter(cfg config.DatabaseConfig, logger *zap.Logger) (*PostgresAdapter, error) {
+	// Build connection string
+	connStr := fmt.Sprintf(
+		"host=%s port=%d user=%s password=%s dbname=%s sslmode=%s",
+		cfg.Host, cfg.Port, cfg.Username, cfg.Password, cfg.Database, cfg.SSLMode,
+	)
+
+	// Connect to database
+	db, err := sqlx.Connect("postgres", connStr)
+	if err != nil {
+		return nil, fmt.Errorf("failed to connect to database: %w", err)
+	}
+
+	// Configure connection pool
+	db.SetMaxOpenConns(cfg.MaxOpenConns)
+	db.SetMaxIdleConns(cfg.MaxIdleConns)
+	db.SetConnMaxLifetime(cfg.ConnMaxLifetime)
+
+	adapter := &PostgresAdapter{
+		db:     db,
+		logger: logger,
+	}
+
+	// Verify connection
+	if err := adapter.Ping(); err != nil {
+		return nil, err
+	}
+
+	return adapter, nil
+}
+
+// Ping checks database connectivity
+func (a *PostgresAdapter) Ping() error {
+	return a.db.Ping()
+}
+
+// Close closes the database connection
+func (a *PostgresAdapter) Close() error {
+	return a.db.Close()
+}
+
+// Transaction executes the given function in a transaction
+func (a *PostgresAdapter) Transaction(ctx context.Context, fn func(tx *sqlx.Tx) error) error {
+	tx, err := a.db.BeginTxx(ctx, nil)
+	if err != nil {
+		return err
+	}
+
+	defer func() {
+		if p := recover(); p != nil {
+			tx.Rollback()
+			panic(p) // re-throw panic after rollback
+		}
+	}()
+
+	if err := fn(tx); err != nil {
+		if rbErr := tx.Rollback(); rbErr != nil {
+			a.logger.Error("Transaction rollback failed", zap.Error(rbErr))
+		}
+		return err
+	}
+
+	return tx.Commit()
+}
+
+// Create stores a new backlog item
+func (a *PostgresAdapter) Create(ctx context.Context, item *model.BacklogItem) error {
+	query := `
+		INSERT INTO backlog_items (
+			id, type, parent_id, title, description, story_points, 
+			status, priority, assignee, tags, created_at, updated_at, external_ids
+		) VALUES (
+			$1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13
+		)
+	`
+
+	tagsArray := pq.Array(item.Tags)
+	externalIDsJSON, err := json.Marshal(item.ExternalIDs)
+	if err != nil {
+		return fmt.Errorf("failed to marshal external IDs: %w", err)
+	}
+
+	_, err = a.db.ExecContext(
+		ctx,
+		query,
+		item.ID,
+		item.Type,
+		item.ParentID,
+		item.Title,
+		item.Description,
+		item.StoryPoints,
+		item.Status,
+		item.Priority,
+		item.Assignee,
+		tagsArray,
+		item.CreatedAt,
+		item.UpdatedAt,
+		externalIDsJSON,
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to create backlog item: %w", err)
+	}
+
+	return nil
+}
+
+// GetByID retrieves a backlog item by its ID
+func (a *PostgresAdapter) GetByID(ctx context.Context, id uuid.UUID) (*model.BacklogItem, error) {
+	query := `
+		SELECT 
+			id, type, parent_id, title, description, story_points, 
+			status, priority, assignee, tags, created_at, updated_at, external_ids
+		FROM backlog_items
+		WHERE id = $1
+	`
+
+	var (
+		item          model.BacklogItem
+		tagsArray     pq.StringArray
+		externalIDsJSON []byte
+	)
+
+	err := a.db.QueryRowxContext(ctx, query, id).Scan(
+		&item.ID,
+		&item.Type,
+		&item.ParentID,
+		&item.Title,
+		&item.Description,
+		&item.StoryPoints,
+		&item.Status,
+		&item.Priority,
+		&item.Assignee,
+		&tagsArray,
+		&item.CreatedAt,
+		&item.UpdatedAt,
+		&externalIDsJSON,
+	)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("backlog item not found: %w", err)
+		}
+		return nil, fmt.Errorf("failed to get backlog item: %w", err)
+	}
+
+	item.Tags = []string(tagsArray)
+
+	err = json.Unmarshal(externalIDsJSON, &item.ExternalIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal external IDs: %w", err)
+	}
+
+	return &item, nil
+}
+
+// GetByExternalID retrieves a backlog item by its external ID
+func (a *PostgresAdapter) GetByExternalID(ctx context.Context, system, externalID string) (*model.BacklogItem, error) {
+	query := `
+		SELECT 
+			id, type, parent_id, title, description, story_points, 
+			status, priority, assignee, tags, created_at, updated_at, external_ids
+		FROM backlog_items
+		WHERE external_ids->$1 = $2
+	`
+
+	var (
+		item            model.BacklogItem
+		tagsArray       pq.StringArray
+		externalIDsJSON []byte
+	)
+
+	err := a.db.QueryRowxContext(ctx, query, system, externalID).Scan(
+		&item.ID,
+		&item.Type,
+		&item.ParentID,
+		&item.Title,
+		&item.Description,
+		&item.StoryPoints,
+		&item.Status,
+		&item.Priority,
+		&item.Assignee,
+		&tagsArray,
+		&item.CreatedAt,
+		&item.UpdatedAt,
+		&externalIDsJSON,
+	)
+
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, fmt.Errorf("backlog item not found: %w", err)
+		}
+		return nil, fmt.Errorf("failed to get backlog item: %w", err)
+	}
+
+	item.Tags = []string(tagsArray)
+
+	err = json.Unmarshal(externalIDsJSON, &item.ExternalIDs)
+	if err != nil {
+		return nil, fmt.Errorf("failed to unmarshal external IDs: %w", err)
+	}
+
+	return &item, nil
+}
+
+// Update updates an existing backlog item
+func (a *PostgresAdapter) Update(ctx context.Context, item *model.BacklogItem) error {
+	query := `
+		UPDATE backlog_items SET
+			type = $1,
+			parent_id = $2,
+			title = $3,
+			description = $4,
+			story_points = $5,
+			status = $6,
+			priority = $7,
+			assignee = $8,
+			tags = $9,
+			updated_at = $10,
+			external_ids = $11
+		WHERE id = $12
+	`
+
+	tagsArray := pq.Array(item.Tags)
+	externalIDsJSON, err := json.Marshal(item.ExternalIDs)
+	if err != nil {
+		return fmt.Errorf("failed to marshal external IDs: %w", err)
+	}
+
+	result, err := a.db.ExecContext(
+		ctx,
+		query,
+		item.Type,
+		item.ParentID,
+		item.Title,
+		item.Description,
+		item.StoryPoints,
+		item.Status,
+		item.Priority,
+		item.Assignee,
+		tagsArray,
+		item.UpdatedAt,
+		externalIDsJSON,
+		item.ID,
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to update backlog item: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if affected == 0 {
+		return fmt.Errorf("backlog item not found")
+	}
+
+	return nil
+}
+
+// Delete deletes a backlog item by its ID
+func (a *PostgresAdapter) Delete(ctx context.Context, id uuid.UUID) error {
+	query := `DELETE FROM backlog_items WHERE id = $1`
+
+	result, err := a.db.ExecContext(ctx, query, id)
+	if err != nil {
+		return fmt.Errorf("failed to delete backlog item: %w", err)
+	}
+
+	affected, err := result.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("failed to get rows affected: %w", err)
+	}
+
+	if affected == 0 {
+		return fmt.Errorf("backlog item not found")
+	}
+
+	return nil
+}
+
+// List retrieves backlog items with pagination
+func (a *PostgresAdapter) List(ctx context.Context, filter repository.BacklogFilter) ([]*model.BacklogItem, int64, error) {
+	// Build the query
+	baseQuery := `
+		SELECT 
+			id, type, parent_id, title, description, story_points, 
+			status, priority, assignee, tags, created_at, updated_at, external_ids
+		FROM backlog_items
+	`
+
+	countQuery := `SELECT COUNT(*) FROM backlog_items`
+
+	// Build WHERE clause
+	whereClause, args := a.buildFilterWhereClause(filter)
+	if whereClause != "" {
+		baseQuery = fmt.Sprintf("%s WHERE %s", baseQuery, whereClause)
+		countQuery = fmt.Sprintf("%s WHERE %s", countQuery, whereClause)
+	}
+
+	// Add ORDER BY and LIMIT/OFFSET
+	if filter.SortBy != "" {
+		sortOrder := "ASC"
+		if filter.SortOrder == "desc" {
+			sortOrder = "DESC"
+		}
+		baseQuery = fmt.Sprintf("%s ORDER BY %s %s", baseQuery, filter.SortBy, sortOrder)
+	} else {
+		baseQuery = fmt.Sprintf("%s ORDER BY priority ASC", baseQuery)
+	}
+
+	if filter.Limit > 0 {
+		baseQuery = fmt.Sprintf("%s LIMIT %d OFFSET %d", baseQuery, filter.Limit, filter.Offset)
+	}
+
+	// Query the total count
+	var totalCount int64
+	err := a.db.QueryRowContext(ctx, countQuery, args...).Scan(&totalCount)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to count backlog items: %w", err)
+	}
+
+	// Query the items
+	rows, err := a.db.QueryxContext(ctx, baseQuery, args...)
+	if err != nil {
+		return nil, 0, fmt.Errorf("failed to query backlog items: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*model.BacklogItem
+	for rows.Next() {
+		var (
+			item            model.BacklogItem
+			tagsArray       pq.StringArray
+			externalIDsJSON []byte
+		)
+
+		err := rows.Scan(
+			&item.ID,
+			&item.Type,
+			&item.ParentID,
+			&item.Title,
+			&item.Description,
+			&item.StoryPoints,
+			&item.Status,
+			&item.Priority,
+			&item.Assignee,
+			&tagsArray,
+			&item.CreatedAt,
+			&item.UpdatedAt,
+			&externalIDsJSON,
+		)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to scan backlog item: %w", err)
+		}
+
+		item.Tags = []string(tagsArray)
+
+		err = json.Unmarshal(externalIDsJSON, &item.ExternalIDs)
+		if err != nil {
+			return nil, 0, fmt.Errorf("failed to unmarshal external IDs: %w", err)
+		}
+
+		items = append(items, &item)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, 0, fmt.Errorf("error iterating rows: %w", err)
+	}
+
+	return items, totalCount, nil
+}
+
+// GetChildren retrieves all children of a backlog item
+func (a *PostgresAdapter) GetChildren(ctx context.Context, parentID uuid.UUID) ([]*model.BacklogItem, error) {
+	query := `
+		SELECT 
+			id, type, parent_id, title, description, story_points, 
+			status, priority, assignee, tags, created_at, updated_at, external_ids
+		FROM backlog_items
+		WHERE parent_id = $1
+		ORDER BY priority ASC
+	`
+
+	rows, err := a.db.QueryxContext(ctx, query, parentID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query children: %w", err)
+	}
+	defer rows.Close()
+
+	var items []*model.BacklogItem
+	for rows.Next() {
+		var (
+			item            model.BacklogItem
+			tagsArray       pq.StringArray
+			externalIDsJSON []byte
+		)
+
+		err := rows.Scan(
+			&item.ID,
+			&item.Type,
+			&item.ParentID,
+			&item.Title,
+			&item.Description,
+			&item.StoryPoints,
+			&item.Status,
+			&item.Priority,
+			&item.Assignee,
+			&tagsArray,
+			&item.CreatedAt,
+			&item.UpdatedAt,
+			&externalIDsJSON,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan backlog item: %w", err)
+		}
+
+		item.Tags = []string(tagsArray)
+
+		err = json.Unmarshal(externalIDsJSON, &item.ExternalIDs)
+		if err != nil {
+			return nil, fmt.Errorf("failed to unmarshal external IDs: %w", err)
+		}
+
+		items = append(items, &item)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %w", err)
+	}
+
+	return items, nil
+}
+
+// UpdatePriorities updates the priorities of multiple items in a batch
+func (a *PostgresAdapter) UpdatePriorities(ctx context.Context, itemPriorities map[uuid.UUID]int) error {
+	return a.Transaction(ctx, func(tx *sqlx.Tx) error {
+		query := `UPDATE backlog_items SET priority = $1, updated_at = $2 WHERE id = $3`
+
+		for itemID, priority := range itemPriorities {
+			_, err := tx.ExecContext(ctx, query, priority, time.Now().UTC(), itemID)
+			if err != nil {
+				return fmt.Errorf("failed to update priority for item %s: %w", itemID, err)
+			}
+		}
+
+		return nil
+	})
+}
+
+// StoreEvent stores a domain event
+func (a *PostgresAdapter) StoreEvent(ctx context.Context, event interface{}) error {
+	// Convert event to JSON
+	eventJSON, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("failed to marshal event: %w", err)
+	}
+
+	// Extract event metadata
+	var (
+		eventID        uuid.UUID
+		eventType      string
+		eventTimestamp time.Time
+		itemID         *uuid.UUID
+	)
+
+	if e, ok := event.(interface{ GetID() uuid.UUID }); ok {
+		eventID = e.GetID()
+	} else {
+		eventID = uuid.New() // Generate a new ID if not available
+	}
+
+	if e, ok := event.(interface{ GetType() string }); ok {
+		eventType = e.GetType()
+	} else {
+		eventType = fmt.Sprintf("%T", event)
+	}
+
+	if e, ok := event.(interface{ GetTimestamp() time.Time }); ok {
+		eventTimestamp = e.GetTimestamp()
+	} else {
+		eventTimestamp = time.Now().UTC()
+	}
+
+	if e, ok := event.(interface{ GetItemID() uuid.UUID }); ok {
+		id := e.GetItemID()
+		itemID = &id
+	}
+
+	query := `
+		INSERT INTO events (
+			id, event_type, item_id, payload, created_at
+		) VALUES (
+			$1, $2, $3, $4, $5
+		)
+	`
+
+	_, err = a.db.ExecContext(
+		ctx,
+		query,
+		eventID,
+		eventType,
+		itemID,
+		eventJSON,
+		eventTimestamp,
+	)
+
+	if err != nil {
+		return fmt.Errorf("failed to store event: %w", err)
+	}
+
+	return nil
+}
+
+// GetEventsByItemID retrieves events for a specific backlog item
+func (a *PostgresAdapter) GetEventsByItemID(ctx context.Context, itemID uuid.UUID) ([]interface{}, error) {
+	query := `
+		SELECT id, event_type, payload, created_at
+		FROM events
+		WHERE item_id = $1
+		ORDER BY created_at ASC
+	`
+
+	rows, err := a.db.QueryContext(ctx, query, itemID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query events: %w", err)
+	}
+	defer rows.Close()
+
+	var events []interface{}
+	for rows.Next() {
+		var (
+			id        uuid.UUID
+			eventType string
+			payload   []byte
+			createdAt time.Time
+		)
+
+		err := rows.Scan(&id, &eventType, &payload, &createdAt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan event: %w", err)
+		}
+
+		// Parse event based on type
+		var event interface{}
+		switch eventType {
+		case string(event.EventTypeItemCreated):
+			var e event.ItemCreatedEvent
+			if err := json.Unmarshal(payload, &e); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal event: %w", err)
+			}
+			event = &e
+		case string(event.EventTypeItemUpdated):
+			var e event.ItemUpdatedEvent
+			if err := json.Unmarshal(payload, &e); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal event: %w", err)
+			}
+			event = &e
+		case string(event.EventTypeItemDeleted):
+			var e event.ItemDeletedEvent
+			if err := json.Unmarshal(payload, &e); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal event: %w", err)
+			}
+			event = &e
+		case string(event.EventTypeExternalIDSet):
+			var e event.ExternalIDSetEvent
+			if err := json.Unmarshal(payload, &e); err != nil {
+				return nil, fmt.Errorf("failed to unmarshal event: %w", err)
+			}
+			event = &e
+		default:
+			return nil, fmt.Errorf("unknown event type: %s", eventType)
+		}
+
+		events = append(events, event)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %w", err)
+	}
+
+	return events, nil
+}
+
+// ReplayEvents replays events to reconstruct state
+func (a *PostgresAdapter) ReplayEvents(ctx context.Context, itemID uuid.UUID) (*model.BacklogItem, error) {
+	events, err := a.GetEventsByItemID(ctx, itemID)
+	if err != nil {
+		return nil, err
+	}
+
+	if len(events) == 0 {
+		return nil, fmt.Errorf("no events found for item %s", itemID)
+	}
+
+	// Find the created event
+	var item *model.BacklogItem
+	for _, e := range events {
+		if createdEvent, ok := e.(*event.ItemCreatedEvent); ok {
+			item = createdEvent.Item
+			break
+		}
+	}
+
+	if item == nil {
+		return nil, fmt.Errorf("created event not found for item %s", itemID)
+	}
+
+	// Apply the rest of the events
+	for _, e := range events {
+		switch evt := e.(type) {
+		case *event.ItemUpdatedEvent:
+			// Apply update
+			*item = *evt.Item
+		case *event.ExternalIDSetEvent:
+			// Set external ID
+			item.SetExternalID(evt.System, evt.ExternalID)
+		}
+	}
+
+	return item, nil
+}
+
+// Helper methods
+
+func (a *PostgresAdapter) buildFilterWhereClause(filter repository.BacklogFilter) (string, []interface{}) {
+	var conditions []string
+	var args []interface{}
+	argCount := 1
+
+	// Filter by types
+	if len(filter.Types) > 0 {
+		placeholders := make([]string, len(filter.Types))
+		for i, t := range filter.Types {
+			placeholders[i] = fmt.Sprintf("$%d", argCount)
+			args = append(args, t)
+			argCount++
+		}
+		conditions = append(conditions, fmt.Sprintf("type IN (%s)", strings.Join(placeholders, ", ")))
+	}
+
+	// Filter by statuses
+	if len(filter.Statuses) > 0 {
+		placeholders := make([]string, len(filter.Statuses))
+		for i, s := range filter.Statuses {
+			placeholders[i] = fmt.Sprintf("$%d", argCount)
+			args = append(args, s)
+			argCount++
+		}
+		conditions = append(conditions, fmt.Sprintf("status IN (%s)", strings.Join(placeholders, ", ")))
+	}
+
+	// Filter by parent ID
+	if filter.ParentID != nil {
+		conditions = append(conditions, fmt.Sprintf("parent_id = $%d", argCount))
+		args = append(args, *filter.ParentID)
+		argCount++
+	}
+
+	// Filter by assignee
+	if filter.Assignee != "" {
+		conditions = append(conditions, fmt.Sprintf("assignee = $%d", argCount))
+		args = append(args, filter.Assignee)
+		argCount++
+	}
+
+	// Filter by tags
+	if len(filter.Tags) > 0 {
+		for _, tag := range filter.Tags {
+			conditions = append(conditions, fmt.Sprintf("tags @> ARRAY[$%d]::text[]", argCount))
+			args = append(args, tag)
+			argCount++
+		}
+	}
+
+	// Filter by search query
+	if filter.SearchQuery != "" {
+		searchCondition := fmt.Sprintf("(title ILIKE $%d OR description ILIKE $%d)", argCount, argCount+1)
+		conditions = append(conditions, searchCondition)
+		searchTerm := "%" + filter.SearchQuery + "%"
+		args = append(args, searchTerm, searchTerm)
+		argCount += 2
+	}
+
+	// Combine all conditions with AND
+	if len(conditions) > 0 {
+		return strings.Join(conditions, " AND "), args
+	}
+
+	return "", args
+}

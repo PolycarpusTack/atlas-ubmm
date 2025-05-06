@@ -1,0 +1,155 @@
+// services/backlog-service/proto/backlog.proto
+
+syntax = "proto3";
+
+package ubmm.backlog.v1;
+
+import "google/protobuf/empty.proto";
+import "google/protobuf/timestamp.proto";
+import "google/protobuf/wrappers.proto";
+
+option go_package = "github.com/ubmm/backlog-service/pkg/api/v1";
+
+// BacklogService defines the gRPC service for managing backlog items
+service BacklogService {
+  // CreateItem creates a new backlog item
+  rpc CreateItem(CreateItemRequest) returns (BacklogItem);
+  
+  // GetItem retrieves a backlog item by ID
+  rpc GetItem(GetItemRequest) returns (BacklogItem);
+  
+  // UpdateItem updates an existing backlog item
+  rpc UpdateItem(UpdateItemRequest) returns (BacklogItem);
+  
+  // DeleteItem deletes a backlog item
+  rpc DeleteItem(DeleteItemRequest) returns (google.protobuf.Empty);
+  
+  // ListItems lists backlog items with filtering
+  rpc ListItems(ListItemsRequest) returns (ListItemsResponse);
+  
+  // GetChildren retrieves all children of a backlog item
+  rpc GetChildren(GetChildrenRequest) returns (GetChildrenResponse);
+  
+  // ReorderItems reorders backlog items by updating their priorities
+  rpc ReorderItems(ReorderItemsRequest) returns (google.protobuf.Empty);
+  
+  // SetExternalID sets an external system ID for a backlog item
+  rpc SetExternalID(SetExternalIDRequest) returns (google.protobuf.Empty);
+  
+  // GetMetrics retrieves backlog metrics
+  rpc GetMetrics(google.protobuf.Empty) returns (BacklogMetrics);
+}
+
+// BacklogItem represents a backlog item (epic, feature, or story)
+message BacklogItem {
+  string id = 1;
+  string type = 2;
+  string parent_id = 3;
+  string title = 4;
+  string description = 5;
+  int32 story_points = 6;
+  string status = 7;
+  int32 priority = 8;
+  string assignee = 9;
+  repeated string tags = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp updated_at = 12;
+  map<string, string> external_ids = 13;
+}
+
+// CreateItemRequest defines the request for creating a backlog item
+message CreateItemRequest {
+  string type = 1;
+  string title = 2;
+  string description = 3;
+  string parent_id = 4;
+  int32 story_points = 5;
+  repeated string tags = 6;
+  string assignee = 7;
+}
+
+// GetItemRequest defines the request for retrieving a backlog item
+message GetItemRequest {
+  string id = 1;
+}
+
+// UpdateItemRequest defines the request for updating a backlog item
+message UpdateItemRequest {
+  string id = 1;
+  google.protobuf.StringValue title = 2;
+  google.protobuf.StringValue description = 3;
+  google.protobuf.StringValue status = 4;
+  google.protobuf.StringValue parent_id = 5;
+  google.protobuf.Int32Value story_points = 6;
+  google.protobuf.Int32Value priority = 7;
+  google.protobuf.StringValue assignee = 8;
+  google.protobuf.StringValue tags = 9;
+}
+
+// DeleteItemRequest defines the request for deleting a backlog item
+message DeleteItemRequest {
+  string id = 1;
+}
+
+// ListItemsRequest defines the request for listing backlog items
+message ListItemsRequest {
+  repeated string types = 1;
+  repeated string statuses = 2;
+  repeated string tags = 3;
+  string parent_id = 4;
+  string assignee = 5;
+  string search_query = 6;
+  int64 page_token = 7;
+  int64 page_size = 8;
+  string sort_by = 9;
+  string sort_order = 10;
+}
+
+// ListItemsResponse defines the response for listing backlog items
+message ListItemsResponse {
+  repeated BacklogItem items = 1;
+  int64 total_count = 2;
+  int64 next_page_token = 3;
+}
+
+// GetChildrenRequest defines the request for retrieving children of a backlog item
+message GetChildrenRequest {
+  string parent_id = 1;
+}
+
+// GetChildrenResponse defines the response for retrieving children
+message GetChildrenResponse {
+  repeated BacklogItem items = 1;
+}
+
+// ReorderItemsRequest defines the request for reordering backlog items
+message ReorderItemsRequest {
+  repeated ReorderItem items = 1;
+}
+
+// ReorderItem defines an item to reorder
+message ReorderItem {
+  string id = 1;
+  int32 priority = 2;
+}
+
+// SetExternalIDRequest defines the request for setting an external ID
+message SetExternalIDRequest {
+  string id = 1;
+  string system = 2;
+  string external_id = 3;
+}
+
+// BacklogMetrics represents metrics for the backlog
+message BacklogMetrics {
+  int32 total_items = 1;
+  int32 epic_count = 2;
+  int32 feature_count = 3;
+  int32 story_count = 4;
+  float average_age = 5;
+  int32 wip_count = 6;
+  float lead_time_days = 7;
+  int32 throughput_last_30_days = 8;
+  float iceberg_ratio = 9;
+  string health_status = 10;
+}

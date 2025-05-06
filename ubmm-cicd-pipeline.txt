@@ -1,0 +1,738 @@
+# .github/workflows/ci-cd.yml
+
+name: UBMM CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+    inputs:
+      deploy_environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev
+          - staging
+          - prod
+
+env:
+  AWS_REGION: eu-central-1
+  ECR_REPOSITORY_PREFIX: ubmm
+  TERRAFORM_VERSION: "1.8.0"
+
+jobs:
+  # Validate and lint code
+  validate:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        service: [backlog-service, api-gateway, frontend]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        if: matrix.service == 'backlog-service'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+      
+      - name: Setup Node.js
+        if: matrix.service != 'backlog-service'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: ${{ matrix.service }}/package-lock.json
+      
+      - name: Install dependencies for Go service
+        if: matrix.service == 'backlog-service'
+        run: |
+          cd services/${{ matrix.service }}
+          go mod download
+      
+      - name: Install dependencies for Node.js service
+        if: matrix.service != 'backlog-service'
+        run: |
+          cd ${{ matrix.service }}
+          npm ci
+      
+      - name: Run linting for Go service
+        if: matrix.service == 'backlog-service'
+        run: |
+          cd services/${{ matrix.service }}
+          go vet ./...
+          go fmt ./...
+      
+      - name: Run linting for Node.js service
+        if: matrix.service != 'backlog-service'
+        run: |
+          cd ${{ matrix.service }}
+          npm run lint
+      
+      - name: Run type checking for frontend
+        if: matrix.service == 'frontend'
+        run: |
+          cd frontend
+          npm run type-check
+
+  # Run tests
+  test:
+    runs-on: ubuntu-latest
+    needs: validate
+    strategy:
+      matrix:
+        service: [backlog-service, api-gateway, frontend]
+    
+    services:
+      postgres:
+        image: postgres:15.4
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: ubmm_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:6
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Go
+        if: matrix.service == 'backlog-service'
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: true
+      
+      - name: Setup Node.js
+        if: matrix.service != 'backlog-service'
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: ${{ matrix.service }}/package-lock.json
+      
+      - name: Install dependencies for Go service
+        if: matrix.service == 'backlog-service'
+        run: |
+          cd services/${{ matrix.service }}
+          go mod download
+      
+      - name: Install dependencies for Node.js service
+        if: matrix.service != 'backlog-service'
+        run: |
+          cd ${{ matrix.service }}
+          npm ci
+      
+      - name: Run database migrations for tests
+        if: matrix.service == 'backlog-service'
+        run: |
+          cd services/${{ matrix.service }}
+          go install -tags 'postgres' github.com/golang-migrate/migrate/v4/cmd/migrate@latest
+          migrate -path ./migrations -database "postgres://postgres:postgres@localhost:5432/ubmm_test?sslmode=disable" up
+      
+      - name: Run tests for Go service
+        if: matrix.service == 'backlog-service'
+        run: |
+          cd services/${{ matrix.service }}
+          go test -race -coverprofile=coverage.txt -covermode=atomic ./...
+      
+      - name: Run tests for Node.js service
+        if: matrix.service != 'backlog-service'
+        run: |
+          cd ${{ matrix.service }}
+          npm test -- --coverage
+      
+      - name: Upload coverage report
+        uses: codecov/codecov-action@v3
+        with:
+          files: ${{ matrix.service == 'backlog-service' && 'services/backlog-service/coverage.txt' || format('{0}/coverage/lcov.info', matrix.service) }}
+          flags: ${{ matrix.service }}
+
+  # Security scan
+  security-scan:
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          ignore-unfixed: true
+          format: 'sarif'
+          output: 'trivy-results.sarif'
+          severity: 'CRITICAL,HIGH'
+      
+      - name: Upload Trivy scan results to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.sarif'
+      
+      - name: Run dependency audit for Node.js projects
+        run: |
+          cd api-gateway && npm audit --production
+          cd ../frontend && npm audit --production
+      
+      - name: Run Go vulnerability check
+        uses: golang/govulncheck-action@v1
+        with:
+          go-version-input: '1.22'
+          go-package: ./services/backlog-service/...
+
+  # Build and push Docker images
+  build:
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      id-token: write
+      contents: read
+    
+    strategy:
+      matrix:
+        service: [backlog-service, api-gateway, frontend]
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Build, tag, and push image to Amazon ECR
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Set the correct directory path
+          if [ "${{ matrix.service }}" = "backlog-service" ]; then
+            SERVICE_DIR="services/${{ matrix.service }}"
+          else
+            SERVICE_DIR="${{ matrix.service }}"
+          fi
+          
+          # Build and push the Docker image
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY_PREFIX-${{ matrix.service }}:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY_PREFIX-${{ matrix.service }}:latest $SERVICE_DIR
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_PREFIX-${{ matrix.service }}:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY_PREFIX-${{ matrix.service }}:latest
+          
+          # Save the image URI for later use
+          echo "::set-output name=image::$ECR_REGISTRY/$ECR_REPOSITORY_PREFIX-${{ matrix.service }}:$IMAGE_TAG"
+
+  # Deploy infrastructure with Terraform
+  deploy-infrastructure:
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TERRAFORM_VERSION }}
+      
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "::set-output name=environment::${{ github.event.inputs.deploy_environment }}"
+          else
+            echo "::set-output name=environment::dev"
+          fi
+      
+      - name: Terraform Init
+        run: |
+          cd infrastructure/terraform
+          terraform init \
+            -backend-config="bucket=ubmm-terraform-state" \
+            -backend-config="key=${{ steps.env.outputs.environment }}/terraform.tfstate" \
+            -backend-config="region=${{ env.AWS_REGION }}"
+      
+      - name: Terraform Validate
+        run: |
+          cd infrastructure/terraform
+          terraform validate
+      
+      - name: Terraform Plan
+        run: |
+          cd infrastructure/terraform
+          terraform plan \
+            -var="environment=${{ steps.env.outputs.environment }}" \
+            -var="name_prefix=ubmm" \
+            -var="aws_region=${{ env.AWS_REGION }}" \
+            -out=tfplan
+      
+      - name: Terraform Apply
+        if: github.event_name == 'push' || github.event.inputs.deploy_environment != ''
+        run: |
+          cd infrastructure/terraform
+          terraform apply -auto-approve tfplan
+
+  # Deploy application
+  deploy-application:
+    runs-on: ubuntu-latest
+    needs: deploy-infrastructure
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+      
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "::set-output name=environment::${{ github.event.inputs.deploy_environment }}"
+          else
+            echo "::set-output name=environment::dev"
+          fi
+      
+      - name: Update ECS services
+        run: |
+          # Register new task definitions for each service
+          aws ecs register-task-definition \
+            --family ubmm-backlog-service-${{ steps.env.outputs.environment }} \
+            --execution-role-arn $(aws iam get-role --role-name ubmm-ecs-task-execution-role-${{ steps.env.outputs.environment }} --query "Role.Arn" --output text) \
+            --task-role-arn $(aws iam get-role --role-name ubmm-ecs-task-role-${{ steps.env.outputs.environment }} --query "Role.Arn" --output text) \
+            --network-mode awsvpc \
+            --requires-compatibilities FARGATE \
+            --cpu 512 \
+            --memory 1024 \
+            --container-definitions '[
+              {
+                "name": "backlog-service",
+                "image": "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}-backlog-service:${{ github.sha }}",
+                "essential": true,
+                "portMappings": [
+                  {
+                    "containerPort": 8080,
+                    "hostPort": 8080,
+                    "protocol": "tcp"
+                  },
+                  {
+                    "containerPort": 8081,
+                    "hostPort": 8081,
+                    "protocol": "tcp"
+                  }
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/ubmm-backlog-service-${{ steps.env.outputs.environment }}",
+                    "awslogs-region": "${{ env.AWS_REGION }}",
+                    "awslogs-stream-prefix": "ecs"
+                  }
+                },
+                "environment": [
+                  {
+                    "name": "ENVIRONMENT",
+                    "value": "${{ steps.env.outputs.environment }}"
+                  }
+                ],
+                "healthCheck": {
+                  "command": ["CMD-SHELL", "curl -f http://localhost:8081/health || exit 1"],
+                  "interval": 30,
+                  "timeout": 5,
+                  "retries": 3,
+                  "startPeriod": 60
+                }
+              }
+            ]'
+          
+          # Update the service with the new task definition
+          aws ecs update-service \
+            --cluster ubmm-cluster-${{ steps.env.outputs.environment }} \
+            --service ubmm-backlog-service-${{ steps.env.outputs.environment }} \
+            --task-definition ubmm-backlog-service-${{ steps.env.outputs.environment }} \
+            --force-new-deployment
+          
+          # Repeat for other services
+          # API Gateway
+          aws ecs register-task-definition \
+            --family ubmm-api-gateway-${{ steps.env.outputs.environment }} \
+            --execution-role-arn $(aws iam get-role --role-name ubmm-ecs-task-execution-role-${{ steps.env.outputs.environment }} --query "Role.Arn" --output text) \
+            --task-role-arn $(aws iam get-role --role-name ubmm-ecs-task-role-${{ steps.env.outputs.environment }} --query "Role.Arn" --output text) \
+            --network-mode awsvpc \
+            --requires-compatibilities FARGATE \
+            --cpu 1024 \
+            --memory 2048 \
+            --container-definitions '[
+              {
+                "name": "api-gateway",
+                "image": "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}-api-gateway:${{ github.sha }}",
+                "essential": true,
+                "portMappings": [
+                  {
+                    "containerPort": 3000,
+                    "hostPort": 3000,
+                    "protocol": "tcp"
+                  }
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/ubmm-api-gateway-${{ steps.env.outputs.environment }}",
+                    "awslogs-region": "${{ env.AWS_REGION }}",
+                    "awslogs-stream-prefix": "ecs"
+                  }
+                },
+                "environment": [
+                  {
+                    "name": "ENVIRONMENT",
+                    "value": "${{ steps.env.outputs.environment }}"
+                  },
+                  {
+                    "name": "BACKLOG_SERVICE_URL",
+                    "value": "backlog-service.${{ steps.env.outputs.environment }}.local:8080"
+                  }
+                ],
+                "healthCheck": {
+                  "command": ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"],
+                  "interval": 30,
+                  "timeout": 5,
+                  "retries": 3,
+                  "startPeriod": 60
+                }
+              }
+            ]'
+          
+          aws ecs update-service \
+            --cluster ubmm-cluster-${{ steps.env.outputs.environment }} \
+            --service ubmm-api-gateway-${{ steps.env.outputs.environment }} \
+            --task-definition ubmm-api-gateway-${{ steps.env.outputs.environment }} \
+            --force-new-deployment
+          
+          # Frontend
+          aws ecs register-task-definition \
+            --family ubmm-frontend-${{ steps.env.outputs.environment }} \
+            --execution-role-arn $(aws iam get-role --role-name ubmm-ecs-task-execution-role-${{ steps.env.outputs.environment }} --query "Role.Arn" --output text) \
+            --task-role-arn $(aws iam get-role --role-name ubmm-ecs-task-role-${{ steps.env.outputs.environment }} --query "Role.Arn" --output text) \
+            --network-mode awsvpc \
+            --requires-compatibilities FARGATE \
+            --cpu 512 \
+            --memory 1024 \
+            --container-definitions '[
+              {
+                "name": "frontend",
+                "image": "${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY_PREFIX }}-frontend:${{ github.sha }}",
+                "essential": true,
+                "portMappings": [
+                  {
+                    "containerPort": 3000,
+                    "hostPort": 3000,
+                    "protocol": "tcp"
+                  }
+                ],
+                "logConfiguration": {
+                  "logDriver": "awslogs",
+                  "options": {
+                    "awslogs-group": "/ecs/ubmm-frontend-${{ steps.env.outputs.environment }}",
+                    "awslogs-region": "${{ env.AWS_REGION }}",
+                    "awslogs-stream-prefix": "ecs"
+                  }
+                },
+                "environment": [
+                  {
+                    "name": "ENVIRONMENT",
+                    "value": "${{ steps.env.outputs.environment }}"
+                  },
+                  {
+                    "name": "NEXT_PUBLIC_API_URL",
+                    "value": "https://api.${{ steps.env.outputs.environment == 'prod' && '' || format('{0}.', steps.env.outputs.environment) }}ubmm.example.com"
+                  }
+                ],
+                "healthCheck": {
+                  "command": ["CMD-SHELL", "curl -f http://localhost:3000/health || exit 1"],
+                  "interval": 30,
+                  "timeout": 5,
+                  "retries": 3,
+                  "startPeriod": 60
+                }
+              }
+            ]'
+          
+          aws ecs update-service \
+            --cluster ubmm-cluster-${{ steps.env.outputs.environment }} \
+            --service ubmm-frontend-${{ steps.env.outputs.environment }} \
+            --task-definition ubmm-frontend-${{ steps.env.outputs.environment }} \
+            --force-new-deployment
+      
+      - name: Wait for deployments to complete
+        run: |
+          # Wait for the services to reach a steady state
+          aws ecs wait services-stable \
+            --cluster ubmm-cluster-${{ steps.env.outputs.environment }} \
+            --services ubmm-backlog-service-${{ steps.env.outputs.environment }} \
+                       ubmm-api-gateway-${{ steps.env.outputs.environment }} \
+                       ubmm-frontend-${{ steps.env.outputs.environment }}
+
+  # Run integration tests
+  integration-tests:
+    runs-on: ubuntu-latest
+    needs: deploy-application
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+      
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: tests/integration/package-lock.json
+      
+      - name: Determine environment URL
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENV="${{ github.event.inputs.deploy_environment }}"
+          else
+            ENV="dev"
+          fi
+          
+          if [ "$ENV" = "prod" ]; then
+            echo "::set-output name=base_url::https://ubmm.example.com"
+            echo "::set-output name=api_url::https://api.ubmm.example.com"
+          else
+            echo "::set-output name=base_url::https://$ENV.ubmm.example.com"
+            echo "::set-output name=api_url::https://api.$ENV.ubmm.example.com"
+          fi
+      
+      - name: Install dependencies
+        run: |
+          cd tests/integration
+          npm ci
+      
+      - name: Run integration tests
+        run: |
+          cd tests/integration
+          npm test
+        env:
+          BASE_URL: ${{ steps.env.outputs.base_url }}
+          API_URL: ${{ steps.env.outputs.api_url }}
+      
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: integration-test-results
+          path: tests/integration/results
+
+  # Post-deploy verification
+  verify-deployment:
+    runs-on: ubuntu-latest
+    needs: integration-tests
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    steps:
+      - name: Determine environment URL
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            ENV="${{ github.event.inputs.deploy_environment }}"
+          else
+            ENV="dev"
+          fi
+          
+          if [ "$ENV" = "prod" ]; then
+            echo "::set-output name=base_url::https://ubmm.example.com"
+            echo "::set-output name=api_url::https://api.ubmm.example.com"
+          else
+            echo "::set-output name=base_url::https://$ENV.ubmm.example.com"
+            echo "::set-output name=api_url::https://api.$ENV.ubmm.example.com"
+          fi
+      
+      - name: Check frontend health
+        run: |
+          curl -f ${{ steps.env.outputs.base_url }}/health || exit 1
+      
+      - name: Check API health
+        run: |
+          curl -f ${{ steps.env.outputs.api_url }}/health || exit 1
+      
+      - name: Run smoke test
+        run: |
+          # Basic smoke test to verify critical endpoints
+          curl -f ${{ steps.env.outputs.api_url }}/graphql \
+            -H "Content-Type: application/json" \
+            -d '{"query":"{ backlogMetrics { totalItems } }"}'
+      
+      - name: Send deployment notification
+        if: success()
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "✅ Deployment to ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_environment || 'dev' }} completed successfully!",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "✅ *Deployment Successful*\n• Environment: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_environment || 'dev' }}\n• Commit: ${{ github.sha }}\n• URL: ${{ steps.env.outputs.base_url }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK
+
+  # Rollback on failure
+  rollback:
+    runs-on: ubuntu-latest
+    needs: [deploy-application, integration-tests, verify-deployment]
+    if: failure() && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    permissions:
+      id-token: write
+      contents: read
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          aws-region: ${{ env.AWS_REGION }}
+      
+      - name: Determine environment
+        id: env
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "::set-output name=environment::${{ github.event.inputs.deploy_environment }}"
+          else
+            echo "::set-output name=environment::dev"
+          fi
+      
+      - name: Get previous task definitions
+        run: |
+          # Get previous task definition ARNs
+          BACKLOG_PREVIOUS_ARN=$(aws ecs describe-task-definition \
+            --task-definition ubmm-backlog-service-${{ steps.env.outputs.environment }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          API_PREVIOUS_ARN=$(aws ecs describe-task-definition \
+            --task-definition ubmm-api-gateway-${{ steps.env.outputs.environment }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          FRONTEND_PREVIOUS_ARN=$(aws ecs describe-task-definition \
+            --task-definition ubmm-frontend-${{ steps.env.outputs.environment }} \
+            --query 'taskDefinition.taskDefinitionArn' \
+            --output text)
+          
+          # Get previous revisions
+          BACKLOG_PREVIOUS_REVISION=$(($(echo $BACKLOG_PREVIOUS_ARN | awk -F: '{print $NF}') - 1))
+          API_PREVIOUS_REVISION=$(($(echo $API_PREVIOUS_ARN | awk -F: '{print $NF}') - 1))
+          FRONTEND_PREVIOUS_REVISION=$(($(echo $FRONTEND_PREVIOUS_ARN | awk -F: '{print $NF}') - 1))
+          
+          # Get full ARNs for previous revisions
+          BACKLOG_ROLLBACK_ARN=$(echo $BACKLOG_PREVIOUS_ARN | sed "s/:[0-9]\+$/:$BACKLOG_PREVIOUS_REVISION/")
+          API_ROLLBACK_ARN=$(echo $API_PREVIOUS_ARN | sed "s/:[0-9]\+$/:$API_PREVIOUS_REVISION/")
+          FRONTEND_ROLLBACK_ARN=$(echo $FRONTEND_PREVIOUS_ARN | sed "s/:[0-9]\+$/:$FRONTEND_PREVIOUS_REVISION/")
+          
+          echo "::set-output name=backlog_rollback_arn::$BACKLOG_ROLLBACK_ARN"
+          echo "::set-output name=api_rollback_arn::$API_ROLLBACK_ARN"
+          echo "::set-output name=frontend_rollback_arn::$FRONTEND_ROLLBACK_ARN"
+      
+      - name: Rollback to previous versions
+        run: |
+          # Rollback backlog service
+          aws ecs update-service \
+            --cluster ubmm-cluster-${{ steps.env.outputs.environment }} \
+            --service ubmm-backlog-service-${{ steps.env.outputs.environment }} \
+            --task-definition ${{ steps.env.outputs.backlog_rollback_arn }} \
+            --force-new-deployment
+          
+          # Rollback API gateway
+          aws ecs update-service \
+            --cluster ubmm-cluster-${{ steps.env.outputs.environment }} \
+            --service ubmm-api-gateway-${{ steps.env.outputs.environment }} \
+            --task-definition ${{ steps.env.outputs.api_rollback_arn }} \
+            --force-new-deployment
+          
+          # Rollback frontend
+          aws ecs update-service \
+            --cluster ubmm-cluster-${{ steps.env.outputs.environment }} \
+            --service ubmm-frontend-${{ steps.env.outputs.environment }} \
+            --task-definition ${{ steps.env.outputs.frontend_rollback_arn }} \
+            --force-new-deployment
+      
+      - name: Send rollback notification
+        uses: slackapi/slack-github-action@v1
+        with:
+          payload: |
+            {
+              "text": "⚠️ Deployment to ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_environment || 'dev' }} failed. Rollback initiated.",
+              "blocks": [
+                {
+                  "type": "section",
+                  "text": {
+                    "type": "mrkdwn",
+                    "text": "⚠️ *Deployment Failed - Rollback Initiated*\n• Environment: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.deploy_environment || 'dev' }}\n• Commit: ${{ github.sha }}\n• See workflow run: https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+                  }
+                }
+              ]
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          SLACK_WEBHOOK_TYPE: INCOMING_WEBHOOK

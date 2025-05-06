@@ -1,0 +1,275 @@
+# infrastructure/terraform/main.tf
+
+terraform {
+  required_version = ">= 1.8.0"
+  
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+  
+  backend "s3" {
+    bucket         = "ubmm-terraform-state"
+    key            = "prod/terraform.tfstate"
+    region         = "eu-central-1"
+    encrypt        = true
+    dynamodb_table = "ubmm-terraform-locks"
+  }
+}
+
+provider "aws" {
+  region = var.aws_region
+  
+  default_tags {
+    tags = {
+      Environment = var.environment
+      Project     = "UBMM"
+      ManagedBy   = "Terraform"
+    }
+  }
+}
+
+# VPC Module
+module "vpc" {
+  source = "./modules/vpc"
+  
+  name_prefix         = var.name_prefix
+  environment         = var.environment
+  vpc_cidr           = var.vpc_cidr
+  availability_zones = var.availability_zones
+  
+  public_subnets  = var.public_subnets
+  private_subnets = var.private_subnets
+  database_subnets = var.database_subnets
+  
+  enable_nat_gateway     = true
+  single_nat_gateway     = var.environment == "production" ? false : true
+  enable_vpn_gateway     = false
+  enable_dns_hostnames   = true
+  enable_dns_support     = true
+  
+  tags = var.tags
+}
+
+# Security Module
+module "security" {
+  source = "./modules/security"
+  
+  vpc_id              = module.vpc.vpc_id
+  name_prefix         = var.name_prefix
+  environment         = var.environment
+  allowed_cidr_blocks = var.allowed_cidr_blocks
+  
+  tags = var.tags
+}
+
+# Database Module (Aurora PostgreSQL)
+module "database" {
+  source = "./modules/database"
+  
+  name_prefix          = var.name_prefix
+  environment          = var.environment
+  vpc_id               = module.vpc.vpc_id
+  database_subnet_ids  = module.vpc.database_subnet_ids
+  security_group_ids   = [module.security.database_security_group_id]
+  
+  engine_version       = "15.4"
+  instance_class       = var.db_instance_class
+  storage_encrypted    = true
+  backup_retention_period = var.environment == "production" ? 30 : 7
+  preferred_backup_window = "02:00-03:00"
+  preferred_maintenance_window = "sun:03:00-sun:04:00"
+  
+  serverless_enabled  = true
+  serverless_min_capacity = 0.5
+  serverless_max_capacity = 16
+  
+  monitoring_interval = 60
+  
+  tags = var.tags
+}
+
+# Redis Module (ElastiCache)
+module "redis" {
+  source = "./modules/redis"
+  
+  name_prefix          = var.name_prefix
+  environment          = var.environment
+  vpc_id               = module.vpc.vpc_id
+  subnet_ids           = module.vpc.private_subnet_ids
+  security_group_ids   = [module.security.redis_security_group_id]
+  
+  node_type            = var.redis_node_type
+  num_cache_nodes      = var.environment == "production" ? 2 : 1
+  engine_version       = "6.x"
+  parameter_group_family = "redis6.x"
+  
+  automatic_failover_enabled = var.environment == "production"
+  multi_az_enabled          = var.environment == "production"
+  
+  at_rest_encryption_enabled = true
+  transit_encryption_enabled = true
+  
+  tags = var.tags
+}
+
+# Kafka Module (MSK)
+module "kafka" {
+  source = "./modules/kafka"
+  
+  name_prefix          = var.name_prefix
+  environment          = var.environment
+  vpc_id               = module.vpc.vpc_id
+  subnet_ids           = module.vpc.private_subnet_ids
+  security_group_ids   = [module.security.kafka_security_group_id]
+  
+  kafka_version        = "3.7.0"
+  instance_type        = var.kafka_instance_type
+  number_of_nodes      = var.environment == "production" ? 3 : 1
+  
+  encryption_in_transit = "TLS"
+  encryption_at_rest_kms_key_arn = aws_kms_key.kafka.arn
+  
+  enhanced_monitoring = var.environment == "production" ? "PER_TOPIC_PER_PARTITION" : "DEFAULT"
+  
+  tags = var.tags
+}
+
+# ECS Fargate Module
+module "ecs" {
+  source = "./modules/ecs"
+  
+  name_prefix          = var.name_prefix
+  environment          = var.environment
+  vpc_id               = module.vpc.vpc_id
+  private_subnet_ids   = module.vpc.private_subnet_ids
+  security_group_ids   = [module.security.ecs_security_group_id]
+  
+  # ALB Configuration
+  alb_subnet_ids       = module.vpc.public_subnet_ids
+  certificate_arn      = var.certificate_arn
+  
+  # Service Configurations
+  services = {
+    api_gateway = {
+      cpu    = 1024
+      memory = 2048
+      desired_count = var.environment == "production" ? 3 : 1
+      container_port = 3000
+      health_check_path = "/health"
+    }
+    backlog_service = {
+      cpu    = 512
+      memory = 1024
+      desired_count = var.environment == "production" ? 3 : 1
+      container_port = 8080
+      health_check_path = "/health"
+    }
+    metrics_service = {
+      cpu    = 512
+      memory = 1024
+      desired_count = var.environment == "production" ? 2 : 1
+      container_port = 8081
+      health_check_path = "/health"
+    }
+  }
+  
+  # Autoscaling Configuration
+  autoscaling_enabled = true
+  min_capacity       = var.environment == "production" ? 2 : 1
+  max_capacity       = var.environment == "production" ? 10 : 3
+  cpu_threshold      = 70
+  memory_threshold   = 80
+  
+  tags = var.tags
+}
+
+# Monitoring Module
+module "monitoring" {
+  source = "./modules/monitoring"
+  
+  name_prefix         = var.name_prefix
+  environment         = var.environment
+  
+  # Dashboard
+  create_dashboard    = true
+  
+  # Alarms
+  alarm_email_endpoints = var.alarm_email_endpoints
+  
+  # Metrics
+  database_cluster_id = module.database.cluster_id
+  redis_cluster_id    = module.redis.cluster_id
+  kafka_cluster_arn   = module.kafka.cluster_arn
+  ecs_cluster_name    = module.ecs.cluster_name
+  
+  tags = var.tags
+}
+
+# KMS Keys
+resource "aws_kms_key" "database" {
+  description             = "KMS key for RDS encryption"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+  
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-database-kms"
+  })
+}
+
+resource "aws_kms_key" "kafka" {
+  description             = "KMS key for MSK encryption"
+  deletion_window_in_days = 7
+  enable_key_rotation     = true
+  
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-kafka-kms"
+  })
+}
+
+# S3 Buckets
+resource "aws_s3_bucket" "logs" {
+  bucket = "${var.name_prefix}-logs-${var.environment}"
+  
+  tags = var.tags
+}
+
+resource "aws_s3_bucket_versioning" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  versioning_configuration {
+    status = "Enabled"
+  }
+}
+
+resource "aws_s3_bucket_server_side_encryption_configuration" "logs" {
+  bucket = aws_s3_bucket.logs.id
+  
+  rule {
+    apply_server_side_encryption_by_default {
+      sse_algorithm = "AES256"
+    }
+  }
+}
+
+# Outputs
+output "vpc_id" {
+  value = module.vpc.vpc_id
+}
+
+output "database_endpoint" {
+  value = module.database.endpoint
+}
+
+output "redis_endpoint" {
+  value = module.redis.endpoint
+}
+
+output "kafka_bootstrap_brokers" {
+  value = module.kafka.bootstrap_brokers
+}
+
+output "alb_dns_name" {
+  value = module.ecs.alb_dns_name
+}

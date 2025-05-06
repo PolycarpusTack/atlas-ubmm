@@ -1,0 +1,206 @@
+# infrastructure/terraform/variables.tf
+
+variable "aws_region" {
+  description = "AWS region to deploy resources"
+  type        = string
+  default     = "eu-central-1"
+}
+
+variable "environment" {
+  description = "Environment name (dev, staging, prod)"
+  type        = string
+  validation {
+    condition     = contains(["dev", "staging", "prod"], var.environment)
+    error_message = "Environment must be dev, staging, or prod."
+  }
+}
+
+variable "name_prefix" {
+  description = "Prefix for resource names"
+  type        = string
+  default     = "ubmm"
+}
+
+variable "vpc_cidr" {
+  description = "CIDR block for VPC"
+  type        = string
+  default     = "10.0.0.0/16"
+}
+
+variable "availability_zones" {
+  description = "List of availability zones"
+  type        = list(string)
+  default     = ["eu-central-1a", "eu-central-1b", "eu-central-1c"]
+}
+
+variable "public_subnets" {
+  description = "CIDR blocks for public subnets"
+  type        = list(string)
+  default     = ["10.0.1.0/24", "10.0.2.0/24", "10.0.3.0/24"]
+}
+
+variable "private_subnets" {
+  description = "CIDR blocks for private subnets"
+  type        = list(string)
+  default     = ["10.0.11.0/24", "10.0.12.0/24", "10.0.13.0/24"]
+}
+
+variable "database_subnets" {
+  description = "CIDR blocks for database subnets"
+  type        = list(string)
+  default     = ["10.0.21.0/24", "10.0.22.0/24", "10.0.23.0/24"]
+}
+
+variable "allowed_cidr_blocks" {
+  description = "CIDR blocks allowed to access resources"
+  type        = list(string)
+  default     = ["0.0.0.0/0"]  # Should be restricted in production
+}
+
+variable "db_instance_class" {
+  description = "Instance class for Aurora PostgreSQL"
+  type        = string
+  default     = "db.t4g.medium"
+}
+
+variable "redis_node_type" {
+  description = "Node type for ElastiCache Redis"
+  type        = string
+  default     = "cache.t4g.small"
+}
+
+variable "kafka_instance_type" {
+  description = "Instance type for MSK Kafka"
+  type        = string
+  default     = "kafka.t3.small"
+}
+
+variable "certificate_arn" {
+  description = "ARN of ACM certificate for ALB"
+  type        = string
+}
+
+variable "alarm_email_endpoints" {
+  description = "Email addresses for CloudWatch alarms"
+  type        = list(string)
+  default     = []
+}
+
+variable "tags" {
+  description = "Additional tags for resources"
+  type        = map(string)
+  default     = {}
+}
+
+# Environment-specific variables
+variable "production_config" {
+  description = "Production environment configuration"
+  type = object({
+    db_instance_class   = string
+    redis_node_type     = string
+    kafka_instance_type = string
+    min_ecs_capacity    = number
+    max_ecs_capacity    = number
+  })
+  default = {
+    db_instance_class   = "db.r6g.xlarge"
+    redis_node_type     = "cache.r6g.large"
+    kafka_instance_type = "kafka.m5.large"
+    min_ecs_capacity    = 2
+    max_ecs_capacity    = 10
+  }
+}
+
+variable "staging_config" {
+  description = "Staging environment configuration"
+  type = object({
+    db_instance_class   = string
+    redis_node_type     = string
+    kafka_instance_type = string
+    min_ecs_capacity    = number
+    max_ecs_capacity    = number
+  })
+  default = {
+    db_instance_class   = "db.t4g.large"
+    redis_node_type     = "cache.t4g.medium"
+    kafka_instance_type = "kafka.t3.small"
+    min_ecs_capacity    = 1
+    max_ecs_capacity    = 5
+  }
+}
+
+variable "dev_config" {
+  description = "Development environment configuration"
+  type = object({
+    db_instance_class   = string
+    redis_node_type     = string
+    kafka_instance_type = string
+    min_ecs_capacity    = number
+    max_ecs_capacity    = number
+  })
+  default = {
+    db_instance_class   = "db.t4g.medium"
+    redis_node_type     = "cache.t4g.small"
+    kafka_instance_type = "kafka.t3.small"
+    min_ecs_capacity    = 1
+    max_ecs_capacity    = 3
+  }
+}
+
+# Cost optimization variables
+variable "enable_spot_instances" {
+  description = "Enable spot instances for ECS tasks"
+  type        = bool
+  default     = false
+}
+
+variable "enable_savings_plans" {
+  description = "Enable savings plans for compute resources"
+  type        = bool
+  default     = false
+}
+
+# Security variables
+variable "enable_encryption_at_rest" {
+  description = "Enable encryption at rest for all services"
+  type        = bool
+  default     = true
+}
+
+variable "enable_waf" {
+  description = "Enable AWS WAF for ALB"
+  type        = bool
+  default     = true
+}
+
+# Monitoring variables
+variable "retention_in_days" {
+  description = "CloudWatch logs retention period"
+  type        = number
+  default     = 30
+}
+
+variable "enable_enhanced_monitoring" {
+  description = "Enable enhanced monitoring for RDS and MSK"
+  type        = bool
+  default     = true
+}
+
+# Backup variables
+variable "backup_retention_period" {
+  description = "Backup retention period in days"
+  type        = number
+  default     = 30
+}
+
+variable "enable_cross_region_backup" {
+  description = "Enable cross-region backup replication"
+  type        = bool
+  default     = false
+}
+
+variable "backup_region" {
+  description = "Region for cross-region backups"
+  type        = string
+  default     = "eu-west-1"
+}

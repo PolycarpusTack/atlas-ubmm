@@ -1,0 +1,368 @@
+# infrastructure/terraform/modules/database/main.tf
+
+# Generate random password
+resource "random_password" "master" {
+  length           = 16
+  special          = true
+  override_special = "!#$%&*()-_=+[]{}<>:?"
+}
+
+# Store password in Secrets Manager
+resource "aws_secretsmanager_secret" "db_password" {
+  name = "${var.name_prefix}-db-password-${var.environment}"
+  
+  tags = var.tags
+}
+
+resource "aws_secretsmanager_secret_version" "db_password" {
+  secret_id     = aws_secretsmanager_secret.db_password.id
+  secret_string = random_password.master.result
+}
+
+# DB Subnet Group
+resource "aws_db_subnet_group" "main" {
+  name       = "${var.name_prefix}-db-subnet-group-${var.environment}"
+  subnet_ids = var.database_subnet_ids
+  
+  tags = merge(var.tags, {
+    Name = "${var.name_prefix}-db-subnet-group-${var.environment}"
+  })
+}
+
+# RDS Parameter Group
+resource "aws_rds_cluster_parameter_group" "main" {
+  name        = "${var.name_prefix}-cluster-pg-${var.environment}"
+  family      = "aurora-postgresql15"
+  description = "Custom cluster parameter group for UBMM"
+  
+  parameter {
+    name  = "log_statement"
+    value = "all"
+  }
+  
+  parameter {
+    name  = "log_min_duration_statement"
+    value = "1000"
+  }
+  
+  parameter {
+    name  = "idle_in_transaction_session_timeout"
+    value = "300000"
+  }
+  
+  parameter {
+    name  = "shared_preload_libraries"
+    value = "pg_stat_statements"
+  }
+  
+  tags = var.tags
+}
+
+resource "aws_db_parameter_group" "main" {
+  name        = "${var.name_prefix}-db-pg-${var.environment}"
+  family      = "aurora-postgresql15"
+  description = "Custom instance parameter group for UBMM"
+  
+  parameter {
+    name  = "log_connections"
+    value = "1"
+  }
+  
+  parameter {
+    name  = "log_disconnections"
+    value = "1"
+  }
+  
+  tags = var.tags
+}
+
+# Aurora Serverless v2 Cluster
+resource "aws_rds_cluster" "main" {
+  cluster_identifier = "${var.name_prefix}-cluster-${var.environment}"
+  engine             = "aurora-postgresql"
+  engine_mode        = var.serverless_enabled ? "provisioned" : "provisioned"
+  engine_version     = var.engine_version
+  database_name      = "${var.name_prefix}_db"
+  master_username    = "dbadmin"
+  master_password    = random_password.master.result
+  
+  db_subnet_group_name            = aws_db_subnet_group.main.name
+  vpc_security_group_ids          = var.security_group_ids
+  db_cluster_parameter_group_name = aws_rds_cluster_parameter_group.main.name
+  
+  backup_retention_period         = var.backup_retention_period
+  preferred_backup_window         = var.preferred_backup_window
+  preferred_maintenance_window    = var.preferred_maintenance_window
+  
+  storage_encrypted              = var.storage_encrypted
+  kms_key_id                     = var.kms_key_id
+  
+  deletion_protection = var.environment == "production" ? true : false
+  skip_final_snapshot = var.environment == "production" ? false : true
+  final_snapshot_identifier = var.environment == "production" ? "${var.name_prefix}-final-snapshot-${formatdate("YYYY-MM-DD-hh-mm", timestamp())}" : null
+  
+  enabled_cloudwatch_logs_exports = ["postgresql"]
+  
+  serverlessv2_scaling_configuration {
+    min_capacity = var.serverless_min_capacity
+    max_capacity = var.serverless_max_capacity
+  }
+  
+  tags = var.tags
+}
+
+# Aurora Instance(s)
+resource "aws_rds_cluster_instance" "main" {
+  count = var.serverless_enabled ? 1 : 2
+  
+  identifier         = "${var.name_prefix}-instance-${count.index + 1}-${var.environment}"
+  cluster_identifier = aws_rds_cluster.main.id
+  instance_class     = var.serverless_enabled ? "db.serverless" : var.instance_class
+  engine             = aws_rds_cluster.main.engine
+  engine_version     = aws_rds_cluster.main.engine_version
+  
+  db_parameter_group_name = aws_db_parameter_group.main.name
+  
+  publicly_accessible     = false
+  monitoring_interval     = var.monitoring_interval
+  monitoring_role_arn     = var.monitoring_interval > 0 ? aws_iam_role.rds_enhanced_monitoring.arn : null
+  
+  performance_insights_enabled          = true
+  performance_insights_retention_period = 7
+  
+  auto_minor_version_upgrade = true
+  
+  tags = var.tags
+}
+
+# IAM Role for Enhanced Monitoring
+resource "aws_iam_role" "rds_enhanced_monitoring" {
+  name = "${var.name_prefix}-rds-monitoring-role-${var.environment}"
+  
+  assume_role_policy = jsonencode({
+    Version = "2012-10-17"
+    Statement = [
+      {
+        Action = "sts:AssumeRole"
+        Effect = "Allow"
+        Principal = {
+          Service = "monitoring.rds.amazonaws.com"
+        }
+      }
+    ]
+  })
+  
+  tags = var.tags
+}
+
+resource "aws_iam_role_policy_attachment" "rds_enhanced_monitoring" {
+  role       = aws_iam_role.rds_enhanced_monitoring.name
+  policy_arn = "arn:aws:iam::aws:policy/service-role/AmazonRDSEnhancedMonitoringRole"
+}
+
+# CloudWatch Alarms
+resource "aws_cloudwatch_metric_alarm" "database_cpu" {
+  alarm_name          = "${var.name_prefix}-db-cpu-utilization-${var.environment}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "CPUUtilization"
+  namespace           = "AWS/RDS"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "80"
+  alarm_description   = "Database CPU utilization is too high"
+  alarm_actions       = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions          = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  
+  dimensions = {
+    DBClusterIdentifier = aws_rds_cluster.main.cluster_identifier
+  }
+  
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "database_connections" {
+  alarm_name          = "${var.name_prefix}-db-connections-${var.environment}"
+  comparison_operator = "GreaterThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "DatabaseConnections"
+  namespace           = "AWS/RDS"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "1000"
+  alarm_description   = "Database connections are too high"
+  alarm_actions       = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions          = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  
+  dimensions = {
+    DBClusterIdentifier = aws_rds_cluster.main.cluster_identifier
+  }
+  
+  tags = var.tags
+}
+
+resource "aws_cloudwatch_metric_alarm" "database_freeable_memory" {
+  alarm_name          = "${var.name_prefix}-db-freeable-memory-${var.environment}"
+  comparison_operator = "LessThanThreshold"
+  evaluation_periods  = "2"
+  metric_name         = "FreeableMemory"
+  namespace           = "AWS/RDS"
+  period              = "300"
+  statistic           = "Average"
+  threshold           = "524288000"  # 500MB
+  alarm_description   = "Database freeable memory is too low"
+  alarm_actions       = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  ok_actions          = var.alarm_sns_topic_arn != "" ? [var.alarm_sns_topic_arn] : []
+  
+  dimensions = {
+    DBClusterIdentifier = aws_rds_cluster.main.cluster_identifier
+  }
+  
+  tags = var.tags
+}
+
+# Module outputs
+output "cluster_id" {
+  description = "The RDS Cluster Identifier"
+  value       = aws_rds_cluster.main.id
+}
+
+output "cluster_arn" {
+  description = "The ARN of the RDS Cluster"
+  value       = aws_rds_cluster.main.arn
+}
+
+output "cluster_endpoint" {
+  description = "The cluster endpoint"
+  value       = aws_rds_cluster.main.endpoint
+}
+
+output "cluster_reader_endpoint" {
+  description = "The cluster reader endpoint"
+  value       = aws_rds_cluster.main.reader_endpoint
+}
+
+output "cluster_port" {
+  description = "The database port"
+  value       = aws_rds_cluster.main.port
+}
+
+output "database_name" {
+  description = "The database name"
+  value       = aws_rds_cluster.main.database_name
+}
+
+output "master_username" {
+  description = "The master username"
+  value       = aws_rds_cluster.main.master_username
+}
+
+output "secret_arn" {
+  description = "The ARN of the secret containing the DB password"
+  value       = aws_secretsmanager_secret.db_password.arn
+}
+
+# infrastructure/terraform/modules/database/variables.tf
+
+variable "name_prefix" {
+  description = "Prefix for resource names"
+  type        = string
+}
+
+variable "environment" {
+  description = "Environment name"
+  type        = string
+}
+
+variable "vpc_id" {
+  description = "ID of the VPC"
+  type        = string
+}
+
+variable "database_subnet_ids" {
+  description = "List of database subnet IDs"
+  type        = list(string)
+}
+
+variable "security_group_ids" {
+  description = "List of security group IDs"
+  type        = list(string)
+}
+
+variable "engine_version" {
+  description = "Aurora PostgreSQL engine version"
+  type        = string
+  default     = "15.4"
+}
+
+variable "instance_class" {
+  description = "Instance class for Aurora instances"
+  type        = string
+  default     = "db.r6g.large"
+}
+
+variable "storage_encrypted" {
+  description = "Enable storage encryption"
+  type        = bool
+  default     = true
+}
+
+variable "kms_key_id" {
+  description = "KMS key ID for storage encryption"
+  type        = string
+  default     = null
+}
+
+variable "backup_retention_period" {
+  description = "Backup retention period in days"
+  type        = number
+  default     = 7
+}
+
+variable "preferred_backup_window" {
+  description = "Daily time range for backups"
+  type        = string
+  default     = "02:00-03:00"
+}
+
+variable "preferred_maintenance_window" {
+  description = "Weekly time range for maintenance"
+  type        = string
+  default     = "sun:03:00-sun:04:00"
+}
+
+variable "serverless_enabled" {
+  description = "Enable Aurora Serverless v2"
+  type        = bool
+  default     = true
+}
+
+variable "serverless_min_capacity" {
+  description = "Minimum Aurora Serverless v2 capacity units"
+  type        = number
+  default     = 0.5
+}
+
+variable "serverless_max_capacity" {
+  description = "Maximum Aurora Serverless v2 capacity units"
+  type        = number
+  default     = 16
+}
+
+variable "monitoring_interval" {
+  description = "Enhanced monitoring interval (0 to disable)"
+  type        = number
+  default     = 60
+}
+
+variable "alarm_sns_topic_arn" {
+  description = "SNS topic ARN for CloudWatch alarms"
+  type        = string
+  default     = ""
+}
+
+variable "tags" {
+  description = "Additional tags for resources"
+  type        = map(string)
+  default     = {}
+}
